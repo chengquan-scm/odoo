@@ -1,0 +1,3 @@
+Database Name : oddo
+Email: oddo@gmail.com
+Password:  oddo

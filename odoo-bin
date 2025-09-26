@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+import os
+import sys
+import logging
+from datetime import datetime
+import pytz
+
+# 设置越南时区
+VIETNAM_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
+
+# 自定义时间格式化器
+class TZFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, VIETNAM_TZ)
+        return dt.strftime(datefmt or "%Y-%m-%d %H:%M:%S")
+
+if __name__ == "__main__":
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    conf_path = os.path.join(current_dir, "odoo.conf")
+
+    sys.argv = [
+        "start_odoo.py",
+        "-c", conf_path,
+        "--dev=all"
+    ]
+
+    import odoo
+
+    # 替换所有现有 Handler 的 formatter
+    for handler in logging.root.handlers:
+        fmt = getattr(handler.formatter, "_fmt", None)
+        if fmt:
+            handler.setFormatter(TZFormatter(fmt))
+
+    # 增加控制台输出 Handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)  # 控制台输出等级，可调
+    console_handler.setFormatter(TZFormatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(console_handler)
+
+    odoo.cli.main()
