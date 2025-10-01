@@ -5,12 +5,17 @@ import pytz
 
 from odoo.exceptions import ValidationError
 from payroll_oca.hr_attendance_payroll.models.utils import HrPayslipUtils, ShiftType, VN_TZ
+import logging
 
+
+# ==== 日志配置 ====
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
 class HrPayslip(models.Model):
     _inherit = 'hr.payslip'
     import time
-    print(time.tzname)
+    logger.info(time.tzname)
     # 白班字段
     standard_hours = fields.Float("标准工时")
     worked_hours = fields.Float("实际工时")
@@ -31,7 +36,7 @@ class HrPayslip(models.Model):
 
     def compute_sheet(self):
         """覆盖 compute_sheet，先计算工时和加班（小时数），再走原计算"""
-        print(f"[HrPayslip][{self.employee_id.name}] >>> 调用 compute_sheet，开始计算工时和加班")
+        logger.info(f"[HrPayslip][{self.employee_id.name}] >>> 调用 compute_sheet，开始计算工时和加班")
         self.compute_attendance_hours()
         return super().compute_sheet()
 
@@ -44,7 +49,7 @@ class HrPayslip(models.Model):
             emp = slip.employee_id
             emp_name = emp.name
             tz = pytz.timezone(emp.user_id.tz or self.env.user.tz or "Asia/Ho_Chi_Minh")
-            print(f"\n[HrPayslip][{emp_name}] === 开始计算工时: {slip.date_from} ~ {slip.date_to} ===")
+            logger.info(f"\n[HrPayslip][{emp_name}] === 开始计算工时: {slip.date_from} ~ {slip.date_to} ===")
 
             # 公共假期（按 employee 提供的方法）
             holiday_dates = set()
@@ -59,10 +64,10 @@ class HrPayslip(models.Model):
                     except Exception:
                         continue
             except Exception as e:
-                print(f"[HrPayslip][{emp_name}] ❌ 获取公共假期失败: {e}")
+                logger.info(f"[HrPayslip][{emp_name}] ❌ 获取公共假期失败: {e}")
                 holiday_dates = set()
 
-            print(f"[HrPayslip][{emp_name}] 公共假日: {sorted(list(holiday_dates))}")
+            logger.info(f"[HrPayslip][{emp_name}] 公共假日: {sorted(list(holiday_dates))}")
 
             # 计算白班标准工时（周一～周六，排除周日和公共假日）
             day_count = (slip.date_to - slip.date_from).days + 1
@@ -70,7 +75,7 @@ class HrPayslip(models.Model):
                 d = slip.date_from + timedelta(days=i)
                 if d.weekday() != 6:
                     standard_hours += 8.0
-            print(f"[HrPayslip][{emp.name}] 白班标准工时(周期内): {standard_hours}h")
+            logger.info(f"[HrPayslip][{emp.name}] 白班标准工时(周期内): {standard_hours}h")
 
 
             # 2. 初始化统计
@@ -137,7 +142,7 @@ class HrPayslip(models.Model):
                 paid_leave_hours_used = min(8.0, standard_hours - total_attendance_hours)
                 total_attendance_hours += paid_leave_hours_used
                 remaining_paid_leave_hours = 8.0 - paid_leave_hours_used
-                print(f"[HrPayslip][{emp.name}] 💼 使用带薪休假补齐: {round(paid_leave_hours_used, 2)}h")
+                logger.info(f"[HrPayslip][{emp.name}] 💼 使用带薪休假补齐: {round(paid_leave_hours_used, 2)}h")
             else:
                 paid_leave_hours_used = 0.0
                 remaining_paid_leave_hours = 8.0
@@ -168,12 +173,12 @@ class HrPayslip(models.Model):
             slip.remaining_paid_leave_hours = remaining_paid_leave_hours
 
             # 最终日志汇总
-            print(
+            logger.info(
                 f"[HrPayslip][{emp.name}] 计算完成 => 标准: {slip.standard_hours}h, 白班: {slip.worked_hours}h, "
                 f"工作日加班: {slip.ot_weekday}h, 周末加班: {slip.ot_weekend}h, 节假日加班: {slip.ot_holiday}h, "
                 f"夜班: {slip.night_regular}h, 夜班深夜: {slip.night_deep}h, 夜班加班: {slip.night_ot}h"
             )
-            print(
+            logger.info(
                 f"[HrPayslip][{emp.name}] 实际出勤：{total_attendance_hours} 出勤率: {slip.attendance_rate}%={total_attendance_hours}/{standard_hours},  带薪休假剩余小时数: {slip.remaining_paid_leave_hours}h")
 
     # --------- --------------------------------------------------

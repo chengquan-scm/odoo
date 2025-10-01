@@ -1,6 +1,14 @@
 from datetime import datetime, timedelta, time
 from enum import Enum
 import pytz
+import logging
+
+# ==== 日志配置 ====
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(levelname)s] %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # ⚡ 固定越南时区
 VN_TZ = pytz.timezone("Asia/Ho_Chi_Minh")
@@ -29,7 +37,7 @@ class HrPayslipUtils:
             raise ValueError("必须传入 tz-aware 的越南本地时间")
         self.check_in_local = check_in_local
         self.check_out_local = check_out_local
-        print(f"[初始化] 打卡区间: {self.check_in_local} ~ {self.check_out_local}")
+        logger.info(f"[初始化] 打卡区间: {self.check_in_local} ~ {self.check_out_local}")
         self.shift_type = self.detect_shift_by_hours_distribution()
 
     @staticmethod
@@ -44,7 +52,7 @@ class HrPayslipUtils:
         white_shift_hours = self._calculate_white_shift_hours()
         night_shift_hours = self._calculate_night_shift_hours()
 
-        print(
+        logger.info(
             f"[班次判定] 统计区间 {self.check_in_local} ~ {self.check_out_local} | "
             f"白班累计: {white_shift_hours:.2f}h | 夜班累计: {night_shift_hours:.2f}h"
         )
@@ -53,10 +61,10 @@ class HrPayslipUtils:
         shift_date = self.check_in_local.date()
 
         if white_shift_hours >= night_shift_hours:
-            print(f"[班次判定] {shift_date} ✅ 判定为白班")
+            logger.info(f"[班次判定] {shift_date} ✅ 判定为白班")
             return ShiftType.WHITE
         else:
-            print(f"[班次判定] {shift_date} 🌙 判定为夜班")
+            logger.info(f"[班次判定] {shift_date} 🌙 判定为夜班")
             return ShiftType.NIGHT
 
 
@@ -74,11 +82,11 @@ class HrPayslipUtils:
             hours = self._calculate_hours_interval(
                 self.check_in_local, self.check_out_local, white_start, white_end
             )
-            print(f"[白班计算] {white_start} ~ {white_end} 覆盖时长: {hours:.2f}h")
+            logger.info(f"[白班计算] {white_start} ~ {white_end} 覆盖时长: {hours:.2f}h")
             total_hours += hours
             current_date += timedelta(days=1)
 
-        print(f"[白班计算] 总时长: {total_hours:.2f}h")
+        logger.info(f"[白班计算] 总时长: {total_hours:.2f}h")
         return total_hours
 
     def _calculate_night_shift_hours(self):
@@ -96,11 +104,11 @@ class HrPayslipUtils:
             hours = self._calculate_hours_interval(
                 self.check_in_local, self.check_out_local, night_start, night_end
             )
-            print(f"[夜班计算] {night_start} ~ {night_end} 覆盖时长: {hours:.2f}h")
+            logger.info(f"[夜班计算] {night_start} ~ {night_end} 覆盖时长: {hours:.2f}h")
             total_hours += hours
             current_date += timedelta(days=1)
 
-        print(f"[夜班计算] 总时长: {total_hours:.2f}h")
+        logger.info(f"[夜班计算] 总时长: {total_hours:.2f}h")
         return total_hours
 
     @staticmethod
@@ -113,7 +121,7 @@ class HrPayslipUtils:
         if start >= end:
             return 0.0
         hours = (end - start).total_seconds() / 3600.0
-        print(f"[DEBUG] ci={ci} ({ci.tzinfo}), interval_start={interval_start} ({interval_start.tzinfo})")
+        logger.info(f"[DEBUG] ci={ci} ({ci.tzinfo}), interval_start={interval_start} ({interval_start.tzinfo})")
         return hours
 
     def validate_attendance_bounds(self):
@@ -134,14 +142,14 @@ class HrPayslipUtils:
         earliest_check_in = official_start - timedelta(hours=1)
         latest_check_out = official_end + timedelta(hours=1)
 
-        print(f"[边界校验] 班次: {self.shift_type.value} | 合法范围: {earliest_check_in} ~ {latest_check_out}")
+        logger.info(f"[边界校验] 班次: {self.shift_type.value} | 合法范围: {earliest_check_in} ~ {latest_check_out}")
 
         if self.check_in_local < earliest_check_in:
             raise ValueError(f"[考勤异常] 上班打卡过早: {self.check_in_local}, 允许最早 {earliest_check_in}")
         if self.check_out_local > latest_check_out:
             raise ValueError(f"[考勤异常] 下班打卡过晚: {self.check_out_local}, 允许最晚 {latest_check_out}")
 
-        print(f"[边界校验] ✅ 打卡时间合法")
+        logger.info(f"[边界校验] ✅ 打卡时间合法")
         return True
 
     def normalize_attendance(self, step: int = 30):
@@ -160,24 +168,24 @@ class HrPayslipUtils:
         # ---- 上班处理 ----
         ci = self.check_in_local
         if ci <= start:
-            print(f"[上班修正] 打卡 {ci} 早于/等于班次开始 {start} → 修正为 {start}")
+            logger.info(f"[上班修正] 打卡 {ci} 早于/等于班次开始 {start} → 修正为 {start}")
             ci = start
         else:
             new_ci = self._round_with_step(start, ci, step=step, direction="ceil")
-            print(f"[上班修正] 打卡 {ci} 晚于班次开始 {start} → 向上取整为 {new_ci}")
+            logger.info(f"[上班修正] 打卡 {ci} 晚于班次开始 {start} → 向上取整为 {new_ci}")
             ci = new_ci
 
         # ---- 下班处理 ----
         co = self.check_out_local
         if co >= end:
-            print(f"[下班修正] 打卡 {co} 晚于/等于班次结束 {end} → 修正为 {end}")
+            logger.info(f"[下班修正] 打卡 {co} 晚于/等于班次结束 {end} → 修正为 {end}")
             co = end
         else:
             new_co = self._round_with_step(end, co, step=step, direction="floor")
-            print(f"[下班修正] 打卡 {co} 早于班次结束 {end} → 向下取整为 {new_co}")
+            logger.info(f"[下班修正] 打卡 {co} 早于班次结束 {end} → 向下取整为 {new_co}")
             co = new_co
 
-        print(f"[规范化结果] 上班: {ci} | 下班: {co}")
+        logger.info(f"[规范化结果] 上班: {ci} | 下班: {co}")
         return ci, co
 
 
@@ -231,8 +239,8 @@ class HrPayslipUtils:
             "ot_weekday": round(white_ot, 2),
         }
 
-        print(f"[白班工时] 标准工时 {white_standard:.2f}h (已扣午休{rest:.2f}h)，加班工时 {white_ot:.2f}h")
-        print(f"[白班工时结果] {result}")
+        logger.info(f"[白班工时] 标准工时 {white_standard:.2f}h (已扣午休{rest:.2f}h)，加班工时 {white_ot:.2f}h")
+        logger.info(f"[白班工时结果] {result}")
         return result
 
 
@@ -271,7 +279,7 @@ class HrPayslipUtils:
             "night_full_days": night_full,
         }
 
-        print(f"[夜班工时] 正常夜班 {night_normal:.2f}h | 深夜夜班 {night_deep:.2f}h | 夜班加班 {night_ot:.2f}h")
-        print(f"[夜班工时] 总工时 {total_hours:.2f}h → 夜宵补贴 night_full={night_full}")
-        print(f"[夜班工时结果] {result}")
+        logger.info(f"[夜班工时] 正常夜班 {night_normal:.2f}h | 深夜夜班 {night_deep:.2f}h | 夜班加班 {night_ot:.2f}h")
+        logger.info(f"[夜班工时] 总工时 {total_hours:.2f}h → 夜宵补贴 night_full={night_full}")
+        logger.info(f"[夜班工时结果] {result}")
         return result
