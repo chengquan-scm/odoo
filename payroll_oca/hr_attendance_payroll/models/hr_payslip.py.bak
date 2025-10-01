@@ -1,0 +1,457 @@
+# -*- coding: utf-8 -*-
+"""
+白班 ：
+    - 标准工时(正常工资): 周一到周六 7:00 - 16:00 扣除中午 12:00 - 13:00 吃饭一小时
+    - 工作日加班（1.5倍）: 16:00 - 19:00
+    - 周末加班(2倍): 工时考勤为准，参考工时 7:00 - 19:00  扣除中午 12:00 - 13:00 吃饭一小时
+    - 节假日加班(3倍): 工时考勤为准，参考工时  7:00 - 19:00  扣除中午 12:00 - 13:00 吃饭一小时
+夜班：
+    - 19:00–22:00 正常夜班（系数1）
+    - 22:00–03:00 深夜夜班（系数1.3）
+    - 03:00–07:00 夜班加班（系数2.1）
+
+还有个思路， 直接将标准工时改为减去带薪休假的8小时，
+另外， 工作日上满8小时算全勤， 还是11小时算全勤
+
+应该去掉字段 是否全勤和 带薪休假已用
+然后加两个字段
+    - 时新 = 基础工资(414W)/标准工时
+    - 出勤率 = （白班 + 夜班 + 深夜班）/ 标准工时 - 8（带薪休假）
+        - 管理补贴，技术补贴等也会随着出勤率浮动
+    - 带薪休假剩余小时数
+"""
+
+
+
+
+
+from odoo import models, fields, api
+from datetime import datetime, timedelta, time
+import pytz
+
+
+class HrPayslip(models.Model):
+    _inherit = 'hr.payslip'
+
+    # 白班字段（原有）
+    standard_hours = fields.Float("标准工时")
+    worked_hours = fields.Float("实际工时")
+    ot_weekday = fields.Float("工作日加班")  # 16:00-19:00
+    ot_weekend = fields.Float("周末加班")
+    ot_holiday = fields.Float("节假日加班")
+
+    # 夜班字段（小时数，不含系数）
+    night_regular = fields.Float("夜班 19-22")
+    night_deep = fields.Float("深夜班 22-03")
+    night_ot = fields.Float("夜班加班 03-07")
+
+    # 新增字段 - 这些字段会在 compute_attendance_hours 中直接计算并赋值
+    attendance_rate = fields.Float("出勤率")
+    remaining_paid_leave_hours = fields.Float("带薪休假剩余小时数")
+    # 新增字段
+    night_full_days = fields.Integer("夜班满勤天数", compute="_compute_night_full_days", store=True)
+
+
+    def compute_sheet(self):
+        """覆盖 compute_sheet，先计算工时和加班（小时数），再走原计算"""
+        print(f"[HrPayslip][{self.employee_id.name}] >>> 调用 compute_sheet，开始计算工时和加班")
+        self.compute_attendance_hours()
+        self._compute_night_full_days()  # 计算夜班天数
+        return super().compute_sheet()
+
+    # ----------------- helper -----------------
+    def _ensure_utc(self, dt):
+        if dt is None:
+            return None
+        if isinstance(dt, datetime):
+            if dt.tzinfo is None:
+                return pytz.UTC.localize(dt)
+            return dt.astimezone(pytz.UTC)
+        return None
+
+    def _overlap_seconds(self, a_start, a_end, b_start, b_end):
+        latest = max(a_start, b_start)
+        earliest = min(a_end, b_end)
+        diff = (earliest - latest).total_seconds()
+        return max(0.0, diff)
+
+    def _calculate_hours_interval(self, a_start, a_end, interval_start, interval_end):
+        """返回 a 与 interval 的重叠小时数（传入 dt 带 tzinfo）"""
+        secs = self._overlap_seconds(a_start, a_end, interval_start, interval_end)
+        return secs / 3600.0
+
+    def _calculate_hours_for_day(self, check_in_utc, check_out_utc, tz, current_day, is_night=False):
+        """
+        计算某一天的工作时长（用于白班基础统计），白班扣午休 12:00-13:00，夜班不扣午休。
+        传入 check_in_utc / check_out_utc 为 UTC aware datetime。
+        返回该 day 与考勤记录的小时数（若考勤跨多天，外层会拆日处理）。
+        """
+        ci_local = check_in_utc.astimezone(tz)
+        co_local = check_out_utc.astimezone(tz)
+
+        day_start = tz.localize(datetime.combine(current_day, time.min))
+        day_end = tz.localize(datetime.combine(current_day, time.max))
+        work_start = max(ci_local, day_start)
+        work_end = min(co_local, day_end)
+        if work_end <= work_start:
+            return 0.0
+
+        total_seconds = (work_end - work_start).total_seconds()
+        if not is_night:
+            # 扣午休 12:00-13:00
+            lunch_start = tz.localize(datetime.combine(current_day, time(12, 0)))
+            lunch_end = tz.localize(datetime.combine(current_day, time(13, 0)))
+            lunch_overlap = max(0, min(work_end, lunch_end).timestamp() - max(work_start, lunch_start).timestamp())
+            return max(0, total_seconds - lunch_overlap) / 3600.0
+        else:
+            return total_seconds / 3600.0
+
+    def _compute_night_full_days(self):
+        """统计夜班 >= 8.5h 的天数"""
+        for slip in self:
+            emp = slip.employee_id
+            tz_name = emp.user_id.tz or self.env.user.tz or 'UTC'
+            tz = pytz.timezone(tz_name)
+            Attendance = self.env['hr.attendance']
+
+            full_night_days = 0
+            day_count = (slip.date_to - slip.date_from).days + 1
+            for i in range(day_count):
+                current_day = slip.date_from + timedelta(days=i)
+                day_start = tz.localize(datetime.combine(current_day, time.min))
+                day_end = tz.localize(datetime.combine(current_day, time.max))
+
+                # 查询当天考勤
+                attendances = Attendance.search([
+                    ('employee_id', '=', emp.id),
+                    ('check_in', '<=', day_end.astimezone(pytz.UTC)),
+                    ('check_out', '>=', day_start.astimezone(pytz.UTC)),
+                ])
+
+                night_hours = 0.0
+                for att in attendances:
+                    if not att.check_in or not att.check_out:
+                        continue
+                    ci = att.check_in.astimezone(tz)
+                    co = att.check_out.astimezone(tz)
+
+                    # 夜班三段：19-22, 22-03, 03-07
+                    nr_start = tz.localize(datetime.combine(current_day, time(19, 0)))
+                    nr_end = tz.localize(datetime.combine(current_day, time(22, 0)))
+                    nd_start = tz.localize(datetime.combine(current_day, time(22, 0)))
+                    nd_end = tz.localize(datetime.combine(current_day + timedelta(days=1), time(3, 0)))
+                    no_start = tz.localize(datetime.combine(current_day + timedelta(days=1), time(3, 0)))
+                    no_end = tz.localize(datetime.combine(current_day + timedelta(days=1), time(7, 0)))
+
+                    # 叠加夜班小时数（不乘系数）
+                    night_hours += slip._calculate_hours_interval(ci, co, nr_start, nr_end)
+                    night_hours += slip._calculate_hours_interval(ci, co, nd_start, nd_end)
+                    night_hours += slip._calculate_hours_interval(ci, co, no_start, no_end)
+
+                if night_hours >= 8.5:
+                    full_night_days += 1
+
+            slip.night_full_days = full_night_days
+            print(f"夜班天数： {full_night_days}")
+
+    def compute_attendance_hours(self):
+        """
+        逐日统计工时（小时），白班/夜班的小时数都只记录小时（不乘任何工资系数）。
+        """
+        print("[HrPayslip] >>> 调用 compute_attendance_hours 方法")
+        Attendance = self.env['hr.attendance']
+
+        for slip in self:
+            emp = slip.employee_id
+            emp_name = emp.name or 'Unknown'
+            print(f"\n[HrPayslip][{emp_name}] === 开始计算工时: {slip.date_from} ~ {slip.date_to} ===")
+
+            # 初始化汇总字段
+            standard_hours = 0.0
+            worked_hours = 0.0
+            ot_weekday = 0.0
+            ot_weekend = 0.0
+            ot_holiday = 0.0
+            night_regular = 0.0
+            night_deep = 0.0
+            night_ot = 0.0
+            attendance_rate = 0.0
+            remaining_paid_leave_hours = 0.0
+
+            # 时区
+            emp_tz_name = emp.user_id.tz or self.env.user.tz or 'UTC'
+            tz = pytz.timezone(emp_tz_name)
+
+            # 公共假期（按 employee 提供的方法）
+            holiday_dates = set()
+            try:
+                public_holidays_data = emp.get_public_holidays_data(slip.date_from, slip.date_to)
+                for bh in public_holidays_data:
+                    try:
+                        start = datetime.fromisoformat(bh['start']).date()
+                        end = datetime.fromisoformat(bh['end']).date()
+                        for dd in range((end - start).days + 1):
+                            holiday_dates.add(start + timedelta(days=dd))
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"[HrPayslip][{emp_name}] ❌ 获取公共假期失败: {e}")
+                holiday_dates = set()
+
+            print(f"[HrPayslip][{emp_name}] 公共假日: {sorted(list(holiday_dates))}")
+
+            # 计算白班标准工时（周一～周六，排除周日和公共假日）
+            day_count = (slip.date_to - slip.date_from).days + 1
+            for i in range(day_count):
+                d = slip.date_from + timedelta(days=i)
+                if d.weekday() != 6:
+                    standard_hours += 8.0
+            print(f"[HrPayslip][{emp_name}] 白班标准工时(周期内): {standard_hours}h")
+
+            # 查询考勤记录（UTC）
+            q_start = pytz.UTC.localize(datetime.combine(slip.date_from, time.min))
+            q_end = pytz.UTC.localize(datetime.combine(slip.date_to, time.max))
+            attendances = Attendance.search([
+                ('employee_id', '=', emp.id),
+                ('check_in', '<=', q_end),
+                ('check_out', '>=', q_start),
+            ])
+            print(f"[HrPayslip][{emp_name}] 找到考勤记录: {len(attendances)} 条")
+
+            # 记录每天小时数用于汇总/日志
+            per_day_info = {}  # date -> dict with details
+            # 初始化 per_day_info
+            for i in range(day_count):
+                current_day = slip.date_from + timedelta(days=i)
+                per_day_info[current_day] = {
+                    'date': current_day,
+                    'is_holiday': (current_day in holiday_dates),
+                    'is_sunday': (current_day.weekday() == 6),
+                    'white_worked': 0.0,
+                    'white_ot16_19': 0.0,  # 工作日加班 16:00-19:00（按天累计）
+                    'white_ot_weekend': 0.0,
+                    'white_ot_holiday': 0.0,
+                    'night_19_22': 0.0,
+                    'night_22_03': 0.0,
+                    'night_03_07': 0.0,
+                    'has_attendance': False,  # 当天是否有考勤
+                }
+
+            # 遍历每条考勤，拆分到每天并统计白班/夜班各段的小时
+            for att in attendances:
+                if not att.check_in or not att.check_out:
+                    continue
+                ci_utc = self._ensure_utc(att.check_in)
+                co_utc = self._ensure_utc(att.check_out)
+                if co_utc <= ci_utc:
+                    continue
+
+                # 将考勤按本地时区拆到对应日期段（使用 ci_local/co_local）
+                ci_local = ci_utc.astimezone(tz)
+                co_local = co_utc.astimezone(tz)
+                start_date = ci_local.date()
+                end_date = co_local.date()
+                for d_off in range((end_date - start_date).days + 1):
+                    current_day = start_date + timedelta(days=d_off)
+                    if current_day < slip.date_from or current_day > slip.date_to:
+                        continue
+
+                    info = per_day_info.get(current_day)
+                    if info is None:
+                        # 如果超出范围则跳过
+                        continue
+
+                    info['has_attendance'] = True  # 标记该天有考勤
+
+                    # 为当前_day 生成本日的 day-interval（本地时区）
+                    day_local_start = tz.localize(datetime.combine(current_day, time.min))
+                    day_local_end = tz.localize(datetime.combine(current_day, time.max))
+
+                    # 计算白班（7:00-16:00 为标准；16:00-19:00 为工作日加班）
+                    # 用考勤原始区间的与当天区间的交集（local）
+                    att_start = max(ci_local, day_local_start)
+                    att_end = min(co_local, day_local_end)
+                    if att_end <= att_start:
+                        continue
+
+                    # 白班标准时间段（7:00-16:00），注意午休 12:00-13:00 要在最终统计时扣一次
+                    std_start = tz.localize(datetime.combine(current_day, time(7, 0)))
+                    std_end = tz.localize(datetime.combine(current_day, time(16, 0)))
+                    std_overlap = self._calculate_hours_interval(att_start, att_end, std_start, std_end)
+                    # 扣午休 12-13 在 later step（如果 std_overlap 包含午休会减掉）
+                    # 这里我们直接计算包含午休的时段，再用专门逻辑扣午休
+                    # 16:00-19:00 工作日加班（不扣午休）
+                    ot_start = tz.localize(datetime.combine(current_day, time(16, 0)))
+                    ot_end = tz.localize(datetime.combine(current_day, time(19, 0)))
+                    ot_overlap = self._calculate_hours_interval(att_start, att_end, ot_start, ot_end)
+
+                    # 周末/节假日视为周末/节假日加班：7:00-16:00（同样扣午休）
+                    wk_start = tz.localize(datetime.combine(current_day, time(7, 0)))
+                    wk_end = tz.localize(datetime.combine(current_day, time(16, 0)))
+                    wk_overlap = self._calculate_hours_interval(att_start, att_end, wk_start, wk_end)
+
+                    # 统计到 info（注意：如果是节假日或周日，std_overlap/ wk_overlap 应分别加到 holiday/weekend）
+                    if info['is_holiday']:
+                        info['white_ot_holiday'] += wk_overlap
+                    elif info['is_sunday']:
+                        info['white_ot_weekend'] += wk_overlap
+                    else:
+                        # 工作日，std_overlap 为 7-16 区间内工作小时（含午休），稍后扣午休
+                        info['white_worked'] += std_overlap
+                        info['white_ot16_19'] += ot_overlap
+
+                    # 夜班统计（以 19:00(current_day) - 07:00(next_day) 为整体，再拆三段）
+                    # 三段：19-22, 22-03(next day), 03-07(next day)
+                    nr_start = tz.localize(datetime.combine(current_day, time(19, 0)))
+                    nr_end = tz.localize(datetime.combine(current_day, time(22, 0)))
+                    nd_start = tz.localize(datetime.combine(current_day, time(22, 0)))
+                    nd_end = tz.localize(datetime.combine(current_day + timedelta(days=1), time(3, 0)))
+                    no_start = tz.localize(datetime.combine(current_day + timedelta(days=1), time(3, 0)))
+                    no_end = tz.localize(datetime.combine(current_day + timedelta(days=1), time(7, 0)))
+
+                    info['night_19_22'] += self._calculate_hours_interval(ci_local.astimezone(tz),
+                                                                          co_local.astimezone(tz), nr_start, nr_end)
+                    info['night_22_03'] += self._calculate_hours_interval(ci_local.astimezone(tz),
+                                                                          co_local.astimezone(tz), nd_start, nd_end)
+                    info['night_03_07'] += self._calculate_hours_interval(ci_local.astimezone(tz),
+                                                                          co_local.astimezone(tz), no_start, no_end)
+
+            # 记录非满勤情况（白班/夜班都适用）
+            absent_days = []
+            total_std_missing = 0.0
+            total_ot_missing = 0.0
+
+            for current_day, info in per_day_info.items():
+                if info['is_holiday'] or info['is_sunday']:
+                    continue
+
+                # 白班满勤标准：7:00-16:00 - 1h午休 + 16:00-19:00加班 = 11h
+                white_full_hours = 11.0
+                white_worked = info['white_worked']
+                white_ot16_19 = info['white_ot16_19']
+
+                # 夜班满勤标准：19:00-07:00 = 12h
+                night_full_hours = 12.0
+                night_worked = info['night_19_22'] + info['night_22_03'] + info['night_03_07']
+
+                # 判断是否满勤
+                full_white = (white_worked + white_ot16_19) >= white_full_hours
+                full_night = night_worked >= night_full_hours
+
+                if not (full_white or full_night):
+                    absent_days.append(current_day)
+
+                    # 计算缺勤小时
+                    white_missing = max(0.0, white_full_hours - (white_worked + white_ot16_19))
+                    night_missing = max(0.0, night_full_hours - night_worked)
+
+                    total_std_missing += white_missing
+                    total_ot_missing += night_missing
+
+                    print(f"[HrPayslip][{emp.name}] ❗ {current_day} 非满勤："
+                          f"白班缺勤 {round(white_missing, 2)}h, 夜班缺勤 {round(night_missing, 2)}h, "
+                          f"实际白班 {round(white_worked, 2)}h + 16-19加班 {round(white_ot16_19, 2)}h, "
+                          f"夜班 {round(night_worked, 2)}h")
+
+            if absent_days:
+                print(f"[HrPayslip][{emp.name}] ❗ 总非满勤日期: {sorted(absent_days)}")
+                print(
+                    f"[HrPayslip][{emp.name}] ❗ 总缺勤小时：标准工时 {round(total_std_missing, 2)}h, 加班 {round(total_ot_missing, 2)}h")
+            else:
+                print(f"[HrPayslip][{emp.name}] ✅ 全勤")
+
+            # 后处理每天信息：扣午休
+            for current_day, info in sorted(per_day_info.items()):
+
+                # 扣午休（如果白班段覆盖午休则扣 1 小时）
+                # 午休为 12:00-13:00，当白班 7-16 时间段内实际覆盖了午休则需要扣去
+                # 计算当天白班7-16覆盖内午休 overlap
+                if not info['is_holiday'] and not info['is_sunday']:
+                    # 7-16 的实际 white_worked （目前包含午休重叠部分），需要扣掉午休在 std 区间的重叠
+                    # 构造午休区间
+                    lunch_start = tz.localize(datetime.combine(info['date'], time(12, 0)))
+                    lunch_end = tz.localize(datetime.combine(info['date'], time(13, 0)))
+                    # 如果白_worked 在 7-16 内有覆盖午休，则减去1小时（或实际覆盖小时）
+                    # 由于我们累计的是重叠小时，若白班段覆盖午休则最少覆盖部分会被计入 white_worked，
+                    # 我们尝试以简单且稳健的方式：若白班7-16累计小时 >= ( (13-7)=6 ) 则说明有覆盖午休 — 直接减去1h
+                    # 更精确方法需要保留原时段数据，这里用简化逻辑（已能覆盖常见场景）
+                    if info['white_worked'] >= 1.0:  # 有工作时长则可能覆盖午休，采用保守处理扣1小时（仅在白班段内）
+                        # 但确保不减负数
+                        reduce_lunch = 1.0 if info['white_worked'] >= 1.0 else 0.0
+                        info['white_worked'] = max(0.0, info['white_worked'] - reduce_lunch)
+
+                # 累计到总量（工资字段）
+                worked_hours += info['white_worked']
+                ot_weekday += info['white_ot16_19']
+                ot_weekend += info['white_ot_weekend']
+                ot_holiday += info['white_ot_holiday']
+                night_regular += info['night_19_22']
+                night_deep += info['night_22_03']
+                night_ot += info['night_03_07']
+
+                # ===== 新增：节假日无条件补充 8 小时到实际工时 =====
+                if info['is_holiday']:
+                    worked_hours += 8.0
+                    # ot_holiday += 8.0   # 如果想同时把 8h 计到节假日加班，取消注释
+                    print(f"[HrPayslip][{emp_name}] {info['date']} 是节假日，已补充 8.0 小时到实际工时")
+
+                # 日志：按日打印详情
+                day_type = "节假日" if info['is_holiday'] else ("周日" if info['is_sunday'] else "工作日")
+                attendance_status = "有考勤" if info['has_attendance'] else "无考勤"
+                print(
+                    f"[HrPayslip][{emp_name}] {info['date']} 类型:{day_type} 考勤状态:{attendance_status} "
+                    f"白班:{round(info['white_worked'], 2)}h + 加班(16-19):{round(info['white_ot16_19'], 2)}h "
+                    f"周末加班:{round(info['white_ot_weekend'], 2)}h 节假日加班:{round(info['white_ot_holiday'], 2)}h "
+                    f"夜班:19-22={round(info['night_19_22'], 2)}h 22-03={round(info['night_22_03'], 2)}h 03-07={round(info['night_03_07'], 2)}h "
+                )
+
+            # 计算总出勤小时数和出勤率
+            total_attendance_hours = worked_hours + night_regular + night_deep
+
+            # 计算需要带薪休假补齐的小时数
+            if total_attendance_hours < standard_hours:
+                paid_leave_hours_used = min(8.0, standard_hours - total_attendance_hours)
+                total_attendance_hours += paid_leave_hours_used
+                remaining_paid_leave_hours = 8.0 - paid_leave_hours_used
+                print(f"[HrPayslip][{emp_name}] 💼 使用带薪休假补齐: {round(paid_leave_hours_used, 2)}h")
+            else:
+                paid_leave_hours_used = 0.0
+                remaining_paid_leave_hours = 8.0
+
+            # 计算出勤率
+            if standard_hours > 0:
+                attendance_rate = min(100.0, (total_attendance_hours / standard_hours) * 100)
+            else:
+                attendance_rate = 0.0
+
+            # 写回工资单字段（四舍五入）
+            slip.standard_hours = round(standard_hours, 2)
+            slip.worked_hours = round(worked_hours, 2)
+            slip.ot_weekday = round(ot_weekday, 2)
+            slip.ot_weekend = round(ot_weekend, 2)
+            slip.ot_holiday = round(ot_holiday, 2)
+            slip.night_regular = round(night_regular, 2)
+            slip.night_deep = round(night_deep, 2)
+            slip.night_ot = round(night_ot, 2)
+            slip.attendance_rate = round(attendance_rate, 2)
+            slip.remaining_paid_leave_hours = round(remaining_paid_leave_hours, 2)
+
+            # 最终日志汇总
+            print(
+                f"[HrPayslip][{emp_name}] 计算完成 => 标准: {slip.standard_hours}h, 实际: {slip.worked_hours}h, "
+                f"工作日加班: {slip.ot_weekday}h, 周末加班: {slip.ot_weekend}h, 节假日加班: {slip.ot_holiday}h, "
+                f"夜班: {slip.night_regular}h, 夜班深夜: {slip.night_deep}h, 夜班加班: {slip.night_ot}h"
+            )
+            print(
+                f"[HrPayslip][{emp_name}] 实际出勤：{slip.worked_hours+slip.night_regular+slip.night_deep} 出勤率: {slip.attendance_rate}%,  带薪休假剩余小时数: {slip.remaining_paid_leave_hours}h")
+
+            # 如果有使用带薪休假，记录详细信息
+            if paid_leave_hours_used > 0:
+                print(f"[HrPayslip][{emp_name}] 📝 带薪休假使用详情: "
+                      f"实际工时{round(worked_hours + night_regular + night_deep, 2)}h + "
+                      f"带薪休假{round(paid_leave_hours_used, 2)}h = "
+                      f"总出勤{round(total_attendance_hours, 2)}h / 标准{standard_hours}h")
+
+
+        return True
+
