@@ -39,6 +39,7 @@ class HrPayslipUtils:
         self.check_out_local = check_out_local
         logger.info(f"[初始化] 打卡区间: {self.check_in_local} ~ {self.check_out_local}")
         self.shift_type = self.detect_shift_by_hours_distribution()
+        self.validate_attendance_bounds()
 
     @staticmethod
     def _make_local_dt(d, t):
